@@ -1,12 +1,15 @@
 package suite
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"os"
 	"reflect"
 	"regexp"
+	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +21,15 @@ import (
 var allTestsFilter = func(_, _ string) (bool, error) { return true, nil }
 var matchMethod = flag.String("testify.m", "", "regular expression to select tests of the testify suite to run")
 
+func getGid() uint {
+	b := make([]byte, 64) //nolint
+	b = b[:runtime.Stack(b, false)]
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	b = b[:bytes.IndexByte(b, ' ')]
+	n, _ := strconv.ParseUint(string(b), 10, 64)
+	return uint(n)
+}
+
 // Suite is a basic testing suite with methods for storing and
 // retrieving the current *testing.T context.
 type Suite struct {
@@ -26,6 +38,7 @@ type Suite struct {
 	mu      sync.RWMutex
 	require *require.Assertions
 	t       *testing.T
+	tMap    map[uint]*testing.T
 
 	// Parent suite to have access to the implemented methods of parent struct
 	s TestingSuite
@@ -35,6 +48,16 @@ type Suite struct {
 func (suite *Suite) T() *testing.T {
 	suite.mu.RLock()
 	defer suite.mu.RUnlock()
+
+	if suite.tMap == nil {
+		suite.tMap = make(map[uint]*testing.T)
+	}
+
+	t, ok := suite.tMap[getGid()]
+	if ok {
+		return t
+	}
+
 	return suite.t
 }
 
@@ -42,9 +65,21 @@ func (suite *Suite) T() *testing.T {
 func (suite *Suite) SetT(t *testing.T) {
 	suite.mu.Lock()
 	defer suite.mu.Unlock()
-	suite.t = t
-	suite.Assertions = assert.New(t)
-	suite.require = require.New(t)
+
+	if suite.tMap == nil {
+		suite.tMap = make(map[uint]*testing.T)
+	}
+
+	suite.tMap[getGid()] = t
+	if suite.t == nil {
+		suite.t = t
+
+		suite.Assertions = assert.New(t)
+		suite.Assertions.SetTFunc(func() assert.TestingT { return suite.T() })
+
+		suite.require = require.New(t)
+		suite.require.SetTFunc(func() require.TestingT { return suite.T() })
+	}
 }
 
 // SetS needs to set the current test suite as parent
@@ -205,7 +240,7 @@ func Run(t *testing.T, suite TestingSuite) {
 		tests = append(tests, test)
 	}
 	if suiteSetupDone {
-		defer func() {
+		t.Cleanup(func() {
 			if tearDownAllSuite, ok := suite.(TearDownAllSuite); ok {
 				tearDownAllSuite.TearDownSuite()
 			}
@@ -214,7 +249,7 @@ func Run(t *testing.T, suite TestingSuite) {
 				stats.End = time.Now()
 				suiteWithStats.HandleStats(suiteName, stats)
 			}
-		}()
+		})
 	}
 
 	runTests(t, tests)
